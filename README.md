@@ -1,6 +1,6 @@
 # Production-Grade Payment Processing System
 
-A distributed payment processing system with Stripe integration, featuring idempotency, distributed locking, webhook handling, reconciliation, and comprehensive monitoring.
+A production-style Stripe payments gateway with Stripe Test Mode integration, Redis-backed idempotency, distributed locking, webhook handling, transactional outbox, daily reconciliation, and full Prometheus/Grafana observability.
 
 ## 🌟 Features
 
