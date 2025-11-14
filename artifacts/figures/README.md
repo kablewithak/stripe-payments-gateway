@@ -1,2 +1,0 @@
-Images(charts, screenshots). Generated, not hand-edited
-
