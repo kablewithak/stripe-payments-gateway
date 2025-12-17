@@ -47,7 +47,13 @@ class Payment(Base):
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     status: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
-    metadata: Mapped[Dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    metadata_json: Mapped[Dict[str, Any] | None] = mapped_column(
+    response_snapshot: Mapped[Dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    "metadata",
+    JSONB,
+    nullable=True,
+    )
+    
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=func.now(), index=True
