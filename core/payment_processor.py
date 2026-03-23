@@ -1,19 +1,11 @@
 """
 Main payment processor with distributed locking and idempotency.
-
-Orchestrates the complete payment flow:
-1. Validate input
-2. Check idempotency
-3. Acquire distributed lock
-4. Create payment record
-5. Call Stripe API
-6. Write to outbox
-7. Commit transaction
-8. Release lock
 """
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any
 
 import redis.asyncio as aioredis
 import structlog
@@ -32,45 +24,31 @@ logger = structlog.get_logger(__name__)
 class PaymentError(Exception):
     """Base exception for payment processing errors."""
 
-    pass
-
 
 class PaymentValidationError(PaymentError):
     """Raised when payment input validation fails."""
-
-    pass
 
 
 class PaymentProcessor:
     """
     Main payment processing orchestrator.
 
-    Handles the complete payment lifecycle with proper error handling,
-    idempotency, and distributed locking.
+    Handles validation, idempotency, persistence, Stripe interaction,
+    audit events, and transactional outbox writes.
     """
 
     def __init__(
         self,
-        stripe_client: Optional[StripeClient] = None,
-        idempotency_manager: Optional[IdempotencyManager] = None,
-        redis_client: Optional[aioredis.Redis] = None,
-    ):
-        """
-        Initialize payment processor.
-
-        Args:
-            stripe_client: Optional Stripe client
-            idempotency_manager: Optional idempotency manager
-            redis_client: Optional Redis client for distributed locking
-        """
+        stripe_client: StripeClient | None = None,
+        idempotency_manager: IdempotencyManager | None = None,
+        redis_client: aioredis.Redis | None = None,
+    ) -> None:
         self.settings = get_settings()
         self.stripe_client = stripe_client or StripeClient()
         self.idempotency_manager = idempotency_manager or IdempotencyManager()
         self.redis_client = redis_client
         self._redis_initialized = False
-
-        # Initialize Redlock for distributed locking
-        self.redlock: Optional[Redlock] = None
+        self.redlock: Redlock | None = None
 
         logger.info("payment_processor_initialized")
 
@@ -88,9 +66,7 @@ class PaymentProcessor:
     def _get_redlock(self) -> Redlock:
         """Get or create Redlock instance."""
         if self.redlock is None:
-            # Parse Redis URL for Redlock
-            redis_url = self.settings.redis_url
-            self.redlock = Redlock([{"url": redis_url}])
+            self.redlock = Redlock([{"url": self.settings.redis_url}])
         return self.redlock
 
     @staticmethod
@@ -99,47 +75,42 @@ class PaymentProcessor:
         amount_cents: int,
         currency: str,
     ) -> None:
-        """
-        Validate payment request parameters.
+        """Validate payment request parameters."""
+        if not user_id:
+            raise PaymentValidationError("User ID is required")
 
-        Args:
-            user_id: User identifier
-            amount_cents: Payment amount in cents
-            currency: Currency code
-
-        Raises:
-            PaymentValidationError: If validation fails
-        """
         if amount_cents <= 0:
             raise PaymentValidationError("Amount must be positive")
 
-        if amount_cents < 50:  # Stripe minimum
+        if amount_cents < 50:
             raise PaymentValidationError("Amount must be at least 50 cents")
 
         if len(currency) != 3:
             raise PaymentValidationError("Currency must be 3-letter code")
 
-        if not user_id:
-            raise PaymentValidationError("User ID is required")
+    @staticmethod
+    def _build_payment_response(payment: Payment) -> dict[str, Any]:
+        """Build API response from a payment model."""
+        return {
+            "id": str(payment.id),
+            "user_id": str(payment.user_id),
+            "amount_cents": payment.amount_cents,
+            "currency": payment.currency,
+            "status": payment.status,
+            "stripe_payment_intent_id": payment.stripe_payment_intent_id,
+            "idempotency_key": payment.idempotency_key,
+            "created_at": payment.created_at.isoformat(),
+        }
 
     async def _record_payment_event(
         self,
         db: AsyncSession,
         payment_id: uuid.UUID,
         event_type: str,
-        event_data: Dict[str, Any],
+        event_data: dict[str, Any],
         correlation_id: uuid.UUID,
     ) -> None:
-        """
-        Record a payment event for audit trail.
-
-        Args:
-            db: Database session
-            payment_id: Payment ID
-            event_type: Event type
-            event_data: Event data
-            correlation_id: Correlation ID for tracing
-        """
+        """Record an immutable payment event."""
         event = PaymentEvent(
             payment_id=payment_id,
             event_type=event_type,
@@ -155,18 +126,9 @@ class PaymentProcessor:
         aggregate_id: uuid.UUID,
         aggregate_type: str,
         event_type: str,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
     ) -> None:
-        """
-        Write event to transactional outbox.
-
-        Args:
-            db: Database session
-            aggregate_id: Aggregate ID (e.g., payment ID)
-            aggregate_type: Aggregate type (e.g., 'payment')
-            event_type: Event type (e.g., 'payment.created')
-            payload: Event payload
-        """
+        """Write a transactional outbox event."""
         outbox_event = OutboxEvent(
             aggregate_id=aggregate_id,
             aggregate_type=aggregate_type,
@@ -182,80 +144,45 @@ class PaymentProcessor:
         user_id: str | uuid.UUID,
         amount_cents: int,
         currency: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        db: Optional[AsyncSession] = None,
-    ) -> Dict[str, Any]:
+        metadata: dict[str, Any] | None = None,
+        db: AsyncSession | None = None,
+    ) -> dict[str, Any]:
         """
         Create a payment with full idempotency and locking.
-
-        Flow:
-        1. Validate input
-        2. Generate idempotency key
-        3. Check idempotency cache
-        4. Acquire distributed lock
-        5. Begin database transaction
-        6. Create payment record
-        7. Call Stripe API
-        8. Write to outbox
-        9. Commit transaction
-        10. Release lock
-
-        Args:
-            user_id: User identifier
-            amount_cents: Payment amount in cents
-            currency: Currency code (e.g., 'USD')
-            metadata: Optional payment metadata
-            db: Optional database session
-
-        Returns:
-            Dict[str, Any]: Payment response
-
-        Raises:
-            PaymentValidationError: If input validation fails
-            PaymentError: If payment processing fails
         """
+        if db is None:
+            raise PaymentError("Database session is required")
+
         correlation_id = uuid.uuid4()
         user_id_uuid = uuid.UUID(str(user_id))
+        normalized_currency = currency.upper()
 
         logger.info(
             "payment_creation_started",
             correlation_id=str(correlation_id),
-            user_id=str(user_id),
+            user_id=str(user_id_uuid),
             amount_cents=amount_cents,
-            currency=currency,
+            currency=normalized_currency,
         )
 
-        # Step 1: Validate input
-        self._validate_payment_request(user_id_uuid, amount_cents, currency)
+        self._validate_payment_request(user_id_uuid, amount_cents, normalized_currency)
 
-        # Step 2: Generate idempotency key
         idempotency_key = IdempotencyManager.generate_key(
             user_id=user_id_uuid,
             amount_cents=amount_cents,
-            currency=currency,
+            currency=normalized_currency,
             metadata=metadata,
         )
 
-        logger.info(
-            "idempotency_key_generated",
-            correlation_id=str(correlation_id),
-            idempotency_key=idempotency_key,
-        )
-
-        # Step 3: Check idempotency cache
-        if db is not None:
-            cached_response = await self.idempotency_manager.check_idempotency(
-                idempotency_key, db
+        cached_response = await self.idempotency_manager.check_idempotency(idempotency_key, db)
+        if cached_response is not None:
+            logger.info(
+                "payment_idempotent_return",
+                correlation_id=str(correlation_id),
+                idempotency_key=idempotency_key,
             )
-            if cached_response:
-                logger.info(
-                    "payment_idempotent_return",
-                    correlation_id=str(correlation_id),
-                    idempotency_key=idempotency_key,
-                )
-                return cached_response
+            return cached_response
 
-        # Step 4: Acquire distributed lock
         lock_key = f"payment:lock:{idempotency_key}"
         redlock = self._get_redlock()
         lock = redlock.lock(lock_key, self.settings.redis_lock_timeout * 1000)
@@ -269,65 +196,55 @@ class PaymentProcessor:
             raise PaymentError("Failed to acquire lock - payment already in progress")
 
         try:
-            logger.info(
-                "payment_lock_acquired",
-                correlation_id=str(correlation_id),
-                lock_key=lock_key,
-            )
+            cached_response = await self.idempotency_manager.check_idempotency(idempotency_key, db)
+            if cached_response is not None:
+                logger.info(
+                    "payment_idempotent_return_after_lock",
+                    correlation_id=str(correlation_id),
+                    idempotency_key=idempotency_key,
+                )
+                return cached_response
 
-            if db is None:
-                raise PaymentError("Database session is required")
-
-            # Step 5: Begin database transaction (already managed by FastAPI dependency)
-            # Step 6: Create payment record
             payment_id = uuid.uuid4()
             payment = Payment(
                 id=payment_id,
                 idempotency_key=idempotency_key,
                 user_id=user_id_uuid,
                 amount_cents=amount_cents,
-                currency=currency.upper(),
+                currency=normalized_currency,
                 status="pending",
-                metadata=metadata,
+                metadata_json=metadata,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow(),
             )
             db.add(payment)
-            await db.flush()  # Get the payment ID
+            await db.flush()
 
-            # Record creation event
             await self._record_payment_event(
                 db=db,
                 payment_id=payment_id,
                 event_type="payment.created",
                 event_data={
                     "amount_cents": amount_cents,
-                    "currency": currency,
+                    "currency": normalized_currency,
                     "status": "pending",
                 },
                 correlation_id=correlation_id,
             )
 
-            logger.info(
-                "payment_record_created",
-                correlation_id=str(correlation_id),
-                payment_id=str(payment_id),
+            payment.status = "processing"
+            await db.flush()
+
+            await self._record_payment_event(
+                db=db,
+                payment_id=payment_id,
+                event_type="payment.processing",
+                event_data={"status": "processing"},
+                correlation_id=correlation_id,
             )
 
-            # Step 7: Call Stripe API
             try:
-                payment.status = "processing"
-                await db.flush()
-
-                await self._record_payment_event(
-                    db=db,
-                    payment_id=payment_id,
-                    event_type="payment.processing",
-                    event_data={"status": "processing"},
-                    correlation_id=correlation_id,
-                )
-
-                stripe_metadata = {
+                stripe_metadata: dict[str, Any] = {
                     "payment_id": str(payment_id),
                     "user_id": str(user_id_uuid),
                     "correlation_id": str(correlation_id),
@@ -337,23 +254,18 @@ class PaymentProcessor:
 
                 payment_intent = await self.stripe_client.create_payment_intent(
                     amount_cents=amount_cents,
-                    currency=currency,
+                    currency=normalized_currency,
                     idempotency_key=idempotency_key,
                     metadata=stripe_metadata,
                 )
 
-                # Update payment with Stripe info
                 payment.stripe_payment_intent_id = payment_intent.id
                 payment.status = payment_intent.status
+                payment.response_snapshot = {
+                    "payment_intent_id": payment_intent.id,
+                    "status": payment_intent.status,
+                }
                 await db.flush()
-
-                logger.info(
-                    "stripe_payment_intent_created",
-                    correlation_id=str(correlation_id),
-                    payment_id=str(payment_id),
-                    payment_intent_id=payment_intent.id,
-                    status=payment_intent.status,
-                )
 
                 await self._record_payment_event(
                     db=db,
@@ -366,10 +278,14 @@ class PaymentProcessor:
                     correlation_id=correlation_id,
                 )
 
-            except StripeError as e:
-                error_message = str(e)
+            except StripeError as exc:
+                error_message = str(exc)
                 payment.status = "failed"
                 payment.error_message = error_message
+                payment.response_snapshot = {
+                    "error": error_message,
+                    "error_type": exc.error_type.value,
+                }
                 await db.flush()
 
                 await self._record_payment_event(
@@ -378,27 +294,17 @@ class PaymentProcessor:
                     event_type="payment.failed",
                     event_data={
                         "error": error_message,
-                        "error_type": e.error_type.value,
+                        "error_type": exc.error_type.value,
                     },
                     correlation_id=correlation_id,
                 )
 
-                logger.error(
-                    "stripe_payment_failed",
-                    correlation_id=str(correlation_id),
-                    payment_id=str(payment_id),
-                    error=error_message,
-                    error_type=e.error_type.value,
-                )
-
-                # Don't retry permanent errors
-                if e.error_type == StripeErrorType.PERMANENT:
+                if exc.error_type == StripeErrorType.PERMANENT:
                     await db.commit()
-                    raise PaymentError(f"Payment failed: {error_message}")
-                else:
-                    raise
+                    raise PaymentError(f"Payment failed: {error_message}") from exc
 
-            # Step 8: Write to outbox
+                raise
+
             await self._write_outbox_event(
                 db=db,
                 aggregate_id=payment_id,
@@ -408,15 +314,18 @@ class PaymentProcessor:
                     "payment_id": str(payment_id),
                     "user_id": str(user_id_uuid),
                     "amount_cents": amount_cents,
-                    "currency": currency,
+                    "currency": normalized_currency,
                     "status": payment.status,
                     "stripe_payment_intent_id": payment.stripe_payment_intent_id,
                     "created_at": payment.created_at.isoformat(),
                 },
             )
 
-            # Step 9: Commit transaction
             await db.commit()
+            await db.refresh(payment)
+
+            response = self._build_payment_response(payment)
+            await self.idempotency_manager.store_response(idempotency_key, response)
 
             logger.info(
                 "payment_created_successfully",
@@ -424,27 +333,17 @@ class PaymentProcessor:
                 payment_id=str(payment_id),
                 status=payment.status,
             )
-
-            # Prepare response
-            response = {
-                "id": str(payment.id),
-                "user_id": str(payment.user_id),
-                "amount_cents": payment.amount_cents,
-                "currency": payment.currency,
-                "status": payment.status,
-                "stripe_payment_intent_id": payment.stripe_payment_intent_id,
-                "idempotency_key": payment.idempotency_key,
-                "created_at": payment.created_at.isoformat(),
-            }
-
-            # Cache response for idempotency
-            await self.idempotency_manager.store_response(idempotency_key, response)
-
             return response
 
         finally:
-            # Step 10: Release lock
-            redlock.unlock(lock)
+            try:
+                redlock.unlock(lock)
+            except Exception as exc:
+                logger.warning(
+                    "payment_lock_release_failed",
+                    error=str(exc),
+                    lock_key=lock_key,
+                )
             logger.info(
                 "payment_lock_released",
                 correlation_id=str(correlation_id),
@@ -452,18 +351,11 @@ class PaymentProcessor:
             )
 
     async def get_payment_status(
-        self, payment_id: str | uuid.UUID, db: AsyncSession
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Get payment status by ID.
-
-        Args:
-            payment_id: Payment ID
-            db: Database session
-
-        Returns:
-            Optional[Dict[str, Any]]: Payment data or None if not found
-        """
+        self,
+        payment_id: str | uuid.UUID,
+        db: AsyncSession,
+    ) -> dict[str, Any] | None:
+        """Get payment status by ID."""
         payment_id_uuid = uuid.UUID(str(payment_id))
 
         stmt = select(Payment).where(Payment.id == payment_id_uuid)
@@ -488,38 +380,17 @@ class PaymentProcessor:
     async def refund_payment(
         self,
         payment_id: str | uuid.UUID,
-        amount_cents: Optional[int] = None,
-        reason: Optional[str] = None,
-        db: Optional[AsyncSession] = None,
-    ) -> Dict[str, Any]:
-        """
-        Refund a payment.
-
-        Args:
-            payment_id: Payment ID
-            amount_cents: Optional partial refund amount
-            reason: Optional refund reason
-            db: Database session
-
-        Returns:
-            Dict[str, Any]: Refund response
-
-        Raises:
-            PaymentError: If refund fails
-        """
+        amount_cents: int | None = None,
+        reason: str | None = None,
+        db: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        """Refund a payment."""
         if db is None:
             raise PaymentError("Database session is required")
 
         payment_id_uuid = uuid.UUID(str(payment_id))
         correlation_id = uuid.uuid4()
 
-        logger.info(
-            "refund_started",
-            correlation_id=str(correlation_id),
-            payment_id=str(payment_id),
-        )
-
-        # Get payment
         stmt = select(Payment).where(Payment.id == payment_id_uuid)
         result = await db.execute(stmt)
         payment = result.scalar_one_or_none()
@@ -533,7 +404,6 @@ class PaymentProcessor:
         if not payment.stripe_payment_intent_id:
             raise PaymentError("Payment has no Stripe PaymentIntent ID")
 
-        # Create refund in Stripe
         try:
             refund = await self.stripe_client.create_refund(
                 payment_intent_id=payment.stripe_payment_intent_id,
@@ -542,7 +412,6 @@ class PaymentProcessor:
                 idempotency_key=f"refund:{payment_id}:{correlation_id}",
             )
 
-            # Update payment status
             payment.status = "refunded"
             await db.flush()
 
@@ -560,13 +429,6 @@ class PaymentProcessor:
 
             await db.commit()
 
-            logger.info(
-                "refund_created_successfully",
-                correlation_id=str(correlation_id),
-                payment_id=str(payment_id),
-                refund_id=refund.id,
-            )
-
             return {
                 "payment_id": str(payment_id),
                 "refund_id": refund.id,
@@ -574,11 +436,11 @@ class PaymentProcessor:
                 "amount_cents": refund.amount,
             }
 
-        except StripeError as e:
+        except StripeError as exc:
             logger.error(
                 "refund_failed",
                 correlation_id=str(correlation_id),
                 payment_id=str(payment_id),
-                error=str(e),
+                error=str(exc),
             )
-            raise PaymentError(f"Refund failed: {str(e)}")
+            raise PaymentError(f"Refund failed: {exc}") from exc
