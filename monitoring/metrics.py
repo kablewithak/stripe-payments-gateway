@@ -10,6 +10,7 @@ Tracks:
 - Reconciliation discrepancies
 - Outbox queue depth
 """
+
 from prometheus_client import Counter, Gauge, Histogram
 
 # Payment metrics
@@ -172,7 +173,9 @@ class MetricsCollector:
 
     @staticmethod
     def record_stripe_api_call(
-        operation: str, status: str, duration_seconds: float
+        operation: str,
+        status: str,
+        duration_seconds: float,
     ) -> None:
         """Record Stripe API call."""
         stripe_api_requests_total.labels(operation=operation, status=status).inc()
@@ -200,14 +203,16 @@ class MetricsCollector:
 
     @staticmethod
     def set_reconciliation_metrics(
-        discrepancies_count: int, discrepancy_cents: int, duration_seconds: float
+        discrepancies_count: int,
+        discrepancy_cents: int,
+        duration_seconds: float,
     ) -> None:
         """Set reconciliation metrics."""
+        import time
+
         reconciliation_discrepancies_total.set(discrepancies_count)
         reconciliation_discrepancy_cents.set(discrepancy_cents)
         reconciliation_duration_seconds.observe(duration_seconds)
-        import time
-
         reconciliation_last_run_timestamp.set(time.time())
 
     @staticmethod
@@ -229,5 +234,4 @@ class MetricsCollector:
             distributed_lock_duration_seconds.observe(duration_seconds)
 
 
-# Export singleton instance
 metrics = MetricsCollector()

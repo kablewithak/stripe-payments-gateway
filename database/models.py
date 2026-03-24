@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -59,8 +60,17 @@ class Payment(Base):
     )
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending", index=True)
-    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="pending",
+        index=True,
+    )
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata",
+        JSONB,
+        nullable=True,
+    )
     response_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -84,7 +94,8 @@ class Payment(Base):
     __table_args__ = (
         CheckConstraint("amount_cents > 0", name="positive_amount"),
         CheckConstraint(
-            "status IN ('pending', 'processing', 'requires_payment_method', 'requires_confirmation', 'requires_action', 'succeeded', 'failed', 'refunded')",
+            "status IN ('pending', 'processing', 'requires_payment_method', "
+            "'requires_confirmation', 'requires_action', 'succeeded', 'failed', 'refunded')",
             name="valid_payment_status",
         ),
         CheckConstraint("length(currency) = 3", name="valid_currency"),
@@ -130,7 +141,50 @@ class PaymentEvent(Base):
     payment: Mapped["Payment"] = relationship(back_populates="events")
 
     def __repr__(self) -> str:
-        return f"<PaymentEvent(id={self.id}, payment_id={self.payment_id}, event_type={self.event_type})>"
+        return (
+            f"<PaymentEvent(id={self.id}, payment_id={self.payment_id}, "
+            f"event_type={self.event_type})>"
+        )
+
+
+class ReconciliationStatus(Base):
+    """
+    Tracks the status and outcome of a reconciliation run for a specific date.
+    """
+
+    __tablename__ = "reconciliation_status"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    reconciliation_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    stripe_total_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    database_total_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    discrepancy_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    discrepancy_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('in_progress', 'completed', 'failed')",
+            name="valid_reconciliation_status",
+        ),
+        Index("idx_reconciliation_status_date", "reconciliation_date"),
+        Index("idx_reconciliation_status_state", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ReconciliationStatus(id={self.id}, "
+            f"reconciliation_date={self.reconciliation_date}, status={self.status})>"
+        )
 
 
 class OutboxEvent(Base):
@@ -141,7 +195,11 @@ class OutboxEvent(Base):
     __tablename__ = "outbox_events"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    aggregate_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
     aggregate_type: Mapped[str] = mapped_column(String(100), nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
@@ -151,7 +209,10 @@ class OutboxEvent(Base):
         nullable=False,
         default=func.now(),
     )
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     __table_args__ = (
         Index("idx_outbox_published_created", "published", "created_at"),
@@ -159,4 +220,7 @@ class OutboxEvent(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<OutboxEvent(id={self.id}, event_type={self.event_type}, published={self.published})>"
+        return (
+            f"<OutboxEvent(id={self.id}, event_type={self.event_type}, "
+            f"published={self.published})>"
+        )

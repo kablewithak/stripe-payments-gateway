@@ -1,72 +1,53 @@
 """
 Pytest configuration and fixtures.
 """
-import asyncio
-from typing import AsyncGenerator, Any
+from __future__ import annotations
+
+import os
+from typing import Any, AsyncGenerator
 
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from api.main import app
-from config import Settings
-from database.connection import get_session_factory
 from database.models import Base
 
-
-@pytest.fixture(scope="session")
-def event_loop() -> asyncio.AbstractEventLoop:
-    """Create event loop for async tests."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
-def test_settings() -> Settings:
-    """Create test settings."""
-    return Settings(
-        stripe_secret_key="sk_test_fake_key_for_testing",
-        stripe_publishable_key="pk_test_fake_key_for_testing",
-        stripe_webhook_secret="whsec_test_fake_secret",
-        database_url="postgresql+asyncpg://postgres:postgres@localhost:5432/payments_test",
-        redis_url="redis://localhost:6379/1",
-        rabbitmq_url="amqp://guest:guest@localhost:5672/",
-        app_name="payment-systems-test",
-        app_env="test",
-        log_level="DEBUG",
-        debug=True,
-    )
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/payments_test",
+)
 
 
 @pytest_asyncio.fixture
 async def test_db() -> AsyncGenerator[AsyncSession, Any]:
-    """Create test database session."""
-    # Create test engine
+    """
+    Create test database session.
+
+    Uses TEST_DATABASE_URL if provided so tests are not hardcoded to one local
+    credential set.
+    """
     engine = create_async_engine(
-        "postgresql+asyncpg://postgres:postgres@localhost:5432/payments_test",
+        TEST_DATABASE_URL,
         poolclass=NullPool,
     )
 
-    # Create tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
 
-    # Create session factory
-    from sqlalchemy.ext.asyncio import async_sessionmaker
-
     session_factory = async_sessionmaker(
-        engine, class_=AsyncSession, expire_on_commit=False
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
     )
 
     async with session_factory() as session:
         yield session
         await session.rollback()
 
-    # Cleanup
     await engine.dispose()
 
 
