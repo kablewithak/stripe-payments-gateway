@@ -1,32 +1,25 @@
 """
 Structured logging configuration.
 
-Uses structlog for JSON-formatted logs with correlation IDs.
+Uses structlog with a single JSON rendering path.
 """
+from __future__ import annotations
+
 import logging
 import sys
 from typing import Any
 
 import structlog
-from pythonjsonlogger import jsonlogger
 
 from config import get_settings
 
 
 def add_app_context(
-    logger: Any, method_name: str, event_dict: dict[str, Any]
+    logger: Any,
+    method_name: str,
+    event_dict: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    Add application context to log events.
-
-    Args:
-        logger: Logger instance
-        method_name: Log method name
-        event_dict: Event dictionary
-
-    Returns:
-        dict[str, Any]: Enhanced event dictionary
-    """
+    """Add application context to log events."""
     settings = get_settings()
     event_dict["app_name"] = settings.app_name
     event_dict["app_env"] = settings.app_env
@@ -35,30 +28,30 @@ def add_app_context(
 
 def setup_logging() -> None:
     """
-    Configure structured logging with JSON formatter.
+    Configure structured logging with a single JSON rendering path.
 
-    Sets up:
-    - JSON-formatted logs
-    - Correlation ID tracking
-    - Structured log fields
-    - ELK/Loki compatibility
+    This avoids double-formatting between structlog and stdlib logging.
     """
     settings = get_settings()
 
-    # Configure structlog
+    timestamper = structlog.processors.TimeStamper(fmt="iso", key="@timestamp")
+
+    shared_processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        timestamper,
+        add_app_context,
+    ]
+
     structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.stdlib.filter_by_level,
-            structlog.stdlib.add_logger_name,
-            structlog.stdlib.add_log_level,
+        processors=shared_processors
+        + [
             structlog.stdlib.PositionalArgumentsFormatter(),
-            structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
             structlog.processors.UnicodeDecoder(),
-            add_app_context,
-            structlog.processors.JSONRenderer(),
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
@@ -66,29 +59,22 @@ def setup_logging() -> None:
         cache_logger_on_first_use=True,
     )
 
-    # Configure standard library logging
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
     root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
     root_logger.setLevel(getattr(logging, settings.log_level))
 
-    # Remove existing handlers
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    # Add JSON handler for stdout
-    json_handler = logging.StreamHandler(sys.stdout)
-    formatter = jsonlogger.JsonFormatter(
-        "%(timestamp)s %(level)s %(name)s %(message)s",
-        rename_fields={
-            "timestamp": "@timestamp",
-            "level": "level",
-            "name": "logger",
-            "message": "message",
-        },
-    )
-    json_handler.setFormatter(formatter)
-    root_logger.addHandler(json_handler)
-
-    # Suppress noisy loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("stripe").setLevel(logging.INFO)
 
@@ -101,13 +87,5 @@ def setup_logging() -> None:
 
 
 def get_logger(name: str) -> Any:
-    """
-    Get a structured logger instance.
-
-    Args:
-        name: Logger name
-
-    Returns:
-        Any: Structured logger
-    """
+    """Get a structured logger instance."""
     return structlog.get_logger(name)

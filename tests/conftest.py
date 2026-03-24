@@ -12,22 +12,24 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from api.main import app
-from database.models import Base
-
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/payments_test",
+    "postgresql+asyncpg://payments_test_user:payments_test_pw@localhost:5432/payments_test",
 )
+
+# Make test runtime deterministic before importing the app.
+os.environ.setdefault("DATABASE_URL", TEST_DATABASE_URL)
+
+from api.main import app  # noqa: E402
+from database.models import Base  # noqa: E402
 
 
 @pytest_asyncio.fixture
 async def test_db() -> AsyncGenerator[AsyncSession, Any]:
     """
-    Create test database session.
+    Create a clean test database session.
 
-    Uses TEST_DATABASE_URL if provided so tests are not hardcoded to one local
-    credential set.
+    Uses TEST_DATABASE_URL so tests never depend on the app runtime DB.
     """
     engine = create_async_engine(
         TEST_DATABASE_URL,
