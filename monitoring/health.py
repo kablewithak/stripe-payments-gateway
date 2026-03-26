@@ -101,7 +101,7 @@ class HealthCheck:
 
         finally:
             if redis_client:
-                await redis_client.close()
+                await redis_client.aclose()
 
     async def check_stripe(self) -> Dict[str, Any]:
         """

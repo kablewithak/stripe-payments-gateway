@@ -61,7 +61,7 @@ class TestDay1Core:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_create_payment_returns_cached_response_when_idempotent(self, test_db) -> None:
+    async def test_create_payment_returns_cached_response_when_idempotent(self) -> None:
         cached_response = {
             "id": str(uuid.uuid4()),
             "user_id": str(uuid.uuid4()),
@@ -77,12 +77,13 @@ class TestDay1Core:
         mock_idempotency.check_idempotency.return_value = cached_response
 
         processor = PaymentProcessor(idempotency_manager=mock_idempotency)
+        fake_db = MagicMock()
 
         result = await processor.create_payment(
             user_id=uuid.uuid4(),
             amount_cents=1000,
             currency="USD",
-            db=test_db,
+            db=fake_db,
         )
 
         assert result == cached_response
@@ -104,13 +105,14 @@ class TestDay1Core:
             idempotency_manager=mock_idempotency,
         )
 
-        mock_lock = MagicMock()
-        mock_lock.__bool__ = lambda self: True
+        mock_acquire_lock = AsyncMock(return_value="lock-token")
+        mock_release_lock = AsyncMock()
 
-        with patch.object(processor, "_get_redlock") as mock_redlock:
-            mock_redlock.return_value.lock.return_value = mock_lock
-            mock_redlock.return_value.unlock = MagicMock()
-
+        with patch.object(processor, "_acquire_payment_lock", mock_acquire_lock), patch.object(
+            processor,
+            "_release_payment_lock",
+            mock_release_lock,
+        ):
             result = await processor.create_payment(
                 user_id=uuid.uuid4(),
                 amount_cents=1000,
@@ -126,6 +128,9 @@ class TestDay1Core:
         assert "idempotency_key" in result
         assert "user_id" in result
         assert "created_at" in result
+
+        mock_acquire_lock.assert_awaited_once()
+        mock_release_lock.assert_awaited_once()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -144,13 +149,14 @@ class TestDay1Core:
             idempotency_manager=mock_idempotency,
         )
 
-        mock_lock = MagicMock()
-        mock_lock.__bool__ = lambda self: True
+        mock_acquire_lock = AsyncMock(return_value="lock-token")
+        mock_release_lock = AsyncMock()
 
-        with patch.object(processor, "_get_redlock") as mock_redlock:
-            mock_redlock.return_value.lock.return_value = mock_lock
-            mock_redlock.return_value.unlock = MagicMock()
-
+        with patch.object(processor, "_acquire_payment_lock", mock_acquire_lock), patch.object(
+            processor,
+            "_release_payment_lock",
+            mock_release_lock,
+        ):
             with pytest.raises(PaymentError, match="Payment failed"):
                 await processor.create_payment(
                     user_id=uuid.uuid4(),
@@ -158,3 +164,6 @@ class TestDay1Core:
                     currency="USD",
                     db=test_db,
                 )
+
+        mock_acquire_lock.assert_awaited_once()
+        mock_release_lock.assert_awaited_once()
