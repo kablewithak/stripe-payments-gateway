@@ -9,7 +9,6 @@ from typing import Any
 
 import redis.asyncio as aioredis
 import structlog
-from redlock import Redlock
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,7 +47,6 @@ class PaymentProcessor:
         self.idempotency_manager = idempotency_manager or IdempotencyManager()
         self.redis_client = redis_client
         self._redis_initialized = False
-        self.redlock: Redlock | None = None
 
         logger.info("payment_processor_initialized")
 
@@ -63,11 +61,98 @@ class PaymentProcessor:
             self._redis_initialized = True
         return self.redis_client
 
-    def _get_redlock(self) -> Redlock:
-        """Get or create Redlock instance."""
-        if self.redlock is None:
-            self.redlock = Redlock([{"url": self.settings.redis_url}])
-        return self.redlock
+    async def _acquire_payment_lock(
+        self,
+        lock_key: str,
+        correlation_id: uuid.UUID,
+    ) -> str | None:
+        """
+        Try to acquire a Redis-based distributed lock.
+
+        Returns:
+            - lock token string if lock acquired
+            - None if Redis is unavailable and we intentionally degrade gracefully
+
+        Raises:
+            PaymentError: if Redis is available but the lock is already held
+        """
+        lock_token = str(uuid.uuid4())
+
+        try:
+            redis_client = await self._ensure_redis()
+            acquired = await redis_client.set(
+                lock_key,
+                lock_token,
+                nx=True,
+                px=self.settings.redis_lock_timeout * 1000,
+            )
+        except Exception as exc:
+            logger.warning(
+                "payment_lock_unavailable_degrading_gracefully",
+                correlation_id=str(correlation_id),
+                lock_key=lock_key,
+                error=str(exc),
+            )
+            return None
+
+        if not acquired:
+            logger.warning(
+                "payment_lock_acquisition_failed",
+                correlation_id=str(correlation_id),
+                lock_key=lock_key,
+            )
+            raise PaymentError("Failed to acquire lock - payment already in progress")
+
+        logger.info(
+            "payment_lock_acquired",
+            correlation_id=str(correlation_id),
+            lock_key=lock_key,
+        )
+        return lock_token
+
+    async def _release_payment_lock(
+        self,
+        lock_key: str,
+        lock_token: str | None,
+        correlation_id: uuid.UUID,
+    ) -> None:
+        """
+        Release Redis-based lock only if we still own it.
+
+        If Redis was unavailable and no lock was acquired, this is a no-op.
+        """
+        if lock_token is None:
+            logger.info(
+                "payment_lock_release_skipped",
+                correlation_id=str(correlation_id),
+                lock_key=lock_key,
+            )
+            return
+
+        try:
+            redis_client = await self._ensure_redis()
+            current_value = await redis_client.get(lock_key)
+
+            if current_value == lock_token:
+                await redis_client.delete(lock_key)
+                logger.info(
+                    "payment_lock_released",
+                    correlation_id=str(correlation_id),
+                    lock_key=lock_key,
+                )
+            else:
+                logger.warning(
+                    "payment_lock_release_skipped_token_mismatch",
+                    correlation_id=str(correlation_id),
+                    lock_key=lock_key,
+                )
+        except Exception as exc:
+            logger.warning(
+                "payment_lock_release_failed",
+                correlation_id=str(correlation_id),
+                lock_key=lock_key,
+                error=str(exc),
+            )
 
     @staticmethod
     def _validate_payment_request(
@@ -184,18 +269,11 @@ class PaymentProcessor:
             return cached_response
 
         lock_key = f"payment:lock:{idempotency_key}"
-        redlock = self._get_redlock()
-        lock = redlock.lock(lock_key, self.settings.redis_lock_timeout * 1000)
-
-        if not lock:
-            logger.warning(
-                "payment_lock_acquisition_failed",
-                correlation_id=str(correlation_id),
-                lock_key=lock_key,
-            )
-            raise PaymentError("Failed to acquire lock - payment already in progress")
+        lock_token: str | None = None
 
         try:
+            lock_token = await self._acquire_payment_lock(lock_key, correlation_id)
+
             cached_response = await self.idempotency_manager.check_idempotency(idempotency_key, db)
             if cached_response is not None:
                 logger.info(
@@ -336,18 +414,10 @@ class PaymentProcessor:
             return response
 
         finally:
-            try:
-                redlock.unlock(lock)
-            except Exception as exc:
-                logger.warning(
-                    "payment_lock_release_failed",
-                    error=str(exc),
-                    lock_key=lock_key,
-                )
-            logger.info(
-                "payment_lock_released",
-                correlation_id=str(correlation_id),
+            await self._release_payment_lock(
                 lock_key=lock_key,
+                lock_token=lock_token,
+                correlation_id=correlation_id,
             )
 
     async def get_payment_status(
