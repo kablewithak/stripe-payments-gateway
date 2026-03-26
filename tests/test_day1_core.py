@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from core.idempotency import IdempotencyManager
-from core.payment_processor import PaymentError, PaymentProcessor, PaymentValidationError
+from core.payment_processor import (
+    PaymentFailedError,
+    PaymentProcessor,
+    PaymentValidationError,
+)
 from integrations.stripe_client import StripeClient, StripeError, StripeErrorType
 
 
@@ -90,7 +95,10 @@ class TestDay1Core:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_create_payment_success_persists_and_returns_schema_shape(self, test_db) -> None:
+    async def test_create_payment_success_persists_and_returns_schema_shape(
+        self,
+        test_db: Any,
+    ) -> None:
         mock_stripe_client = AsyncMock(spec=StripeClient)
         mock_payment_intent = MagicMock()
         mock_payment_intent.id = "pi_test_123"
@@ -131,10 +139,14 @@ class TestDay1Core:
 
         mock_acquire_lock.assert_awaited_once()
         mock_release_lock.assert_awaited_once()
+        mock_idempotency.store_response.assert_awaited_once()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_create_payment_permanent_stripe_error_raises_payment_error(self, test_db) -> None:
+    async def test_create_payment_permanent_stripe_error_raises_payment_failed_error(
+        self,
+        test_db: Any,
+    ) -> None:
         mock_stripe_client = AsyncMock(spec=StripeClient)
         mock_stripe_client.create_payment_intent.side_effect = StripeError(
             "Card declined",
@@ -157,7 +169,7 @@ class TestDay1Core:
             "_release_payment_lock",
             mock_release_lock,
         ):
-            with pytest.raises(PaymentError, match="Payment failed"):
+            with pytest.raises(PaymentFailedError, match="Payment failed: Card declined"):
                 await processor.create_payment(
                     user_id=uuid.uuid4(),
                     amount_cents=1000,
