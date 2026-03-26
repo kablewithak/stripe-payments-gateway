@@ -5,29 +5,40 @@ Implements:
 - Webhook signature verification
 - Event deduplication using Redis
 - Async event processing
-- Retry logic for failed events
-- Event Sourcing (Audit Logging)
+- Graceful degradation when Redis is unavailable
+- Event sourcing / audit logging for payment lifecycle updates
 """
-import hashlib
-import uuid  # Critical for generating correlation_ids
-from typing import Any, Callable, Dict, Optional
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Any, Awaitable, Callable
 
 import redis.asyncio as aioredis
 import stripe
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Architecture: Import both the Whiteboard (Payment) and the Receipt (PaymentEvent)
-from database.models import Payment, PaymentEvent
 from config import get_settings
+from database.models import Payment, PaymentEvent
 
 logger = structlog.get_logger(__name__)
 
+HandlerResult = dict[str, Any]
+WebhookHandlerFunc = Callable[..., Awaitable[HandlerResult]]
+
 
 class WebhookError(Exception):
-    """Raised when webhook processing fails."""
-    pass
+    """Base exception for webhook failures."""
+
+
+class WebhookVerificationError(WebhookError):
+    """Raised when webhook signature verification fails."""
+
+
+class WebhookProcessingError(WebhookError):
+    """Raised when webhook event processing fails."""
 
 
 class WebhookHandler:
@@ -35,31 +46,118 @@ class WebhookHandler:
     Handles Stripe webhook events with deduplication and processing.
     """
 
-    def __init__(self, redis_client: Optional[aioredis.Redis] = None):
+    def __init__(self, redis_client: aioredis.Redis | None = None) -> None:
         self.settings = get_settings()
         self.redis_client = redis_client
-        self._redis_initialized = False
-        self.event_handlers: Dict[str, Callable] = {}
-        logger.info("webhook_handler_initialized")
+        self._redis_initialized = redis_client is not None
+        self.event_handlers: dict[str, WebhookHandlerFunc] = {}
+        logger.info(
+            "webhook_handler_initialized",
+            redis_client_injected=redis_client is not None,
+        )
 
     async def _ensure_redis(self) -> aioredis.Redis:
-        if self.redis_client is None or not self._redis_initialized:
+        """
+        Ensure a Redis client exists.
+
+        Important:
+        - If a Redis client was injected, keep using it.
+        - Only create a new client when no client exists.
+        """
+        if self.redis_client is None:
             self.redis_client = await aioredis.from_url(
                 self.settings.redis_url,
                 encoding="utf-8",
                 decode_responses=True,
             )
             self._redis_initialized = True
+            logger.info("webhook_handler_redis_initialized_from_settings")
+            return self.redis_client
+
+        if not self._redis_initialized:
+            self._redis_initialized = True
+            logger.info("webhook_handler_redis_marked_initialized")
+
         return self.redis_client
 
-    def register_handler(self, event_type: str, handler: Callable) -> None:
+    @staticmethod
+    def _processed_event_key(event_id: str) -> str:
+        """Build Redis key for processed webhook deduplication."""
+        return f"webhook:processed:{event_id}"
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Centralized UTC timestamp helper."""
+        return datetime.utcnow()
+
+    async def _rollback_safely(self, db: AsyncSession, event_id: str) -> None:
+        """Best-effort rollback helper that does not mask the original error."""
+        try:
+            await db.rollback()
+        except Exception as exc:
+            logger.warning(
+                "webhook_db_rollback_failed",
+                event_id=event_id,
+                error=str(exc),
+            )
+
+    async def _get_payment_by_intent_id(
+        self,
+        payment_intent_id: str,
+        db: AsyncSession,
+    ) -> Payment | None:
+        """Fetch a payment by Stripe PaymentIntent ID."""
+        query = select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
+        result = await db.execute(query)
+        return result.scalar_one_or_none()
+
+    async def _record_payment_event(
+        self,
+        db: AsyncSession,
+        payment_id: uuid.UUID,
+        event_type: str,
+        event_data: dict[str, Any],
+    ) -> None:
+        """Persist an immutable audit event."""
+        event = PaymentEvent(
+            payment_id=payment_id,
+            event_type=event_type,
+            event_data=event_data,
+            correlation_id=uuid.uuid4(),
+            created_at=self._utcnow(),
+        )
+        db.add(event)
+
+    @staticmethod
+    def _set_payment_status(
+        payment: Payment,
+        *,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        """Apply consistent payment state updates."""
+        payment.status = status
+        if hasattr(payment, "updated_at"):
+            payment.updated_at = datetime.utcnow()
+        if error_message is not None:
+            payment.error_message = error_message
+        elif hasattr(payment, "error_message") and status in {"succeeded", "refunded"}:
+            payment.error_message = None
+
+    def register_handler(self, event_type: str, handler: WebhookHandlerFunc) -> None:
+        """Register an async handler for a Stripe event type."""
         self.event_handlers[event_type] = handler
         logger.info("webhook_handler_registered", event_type=event_type)
 
     def verify_signature(
-        self, payload: bytes, signature: str, secret: Optional[str] = None
+        self,
+        payload: bytes,
+        signature: str,
+        secret: str | None = None,
     ) -> stripe.Event:
+        """Verify Stripe webhook signature and return the parsed event."""
         webhook_secret = secret or self.settings.stripe_webhook_secret
+
         try:
             event = stripe.Webhook.construct_event(
                 payload=payload,
@@ -72,37 +170,69 @@ class WebhookHandler:
                 event_type=event.type,
             )
             return event
-        except stripe.error.SignatureVerificationError as e:
-            logger.error("webhook_signature_verification_failed", error=str(e))
-            raise WebhookError(f"Invalid webhook signature: {str(e)}")
-        except Exception as e:
-            logger.error("webhook_verification_error", error=str(e))
-            raise WebhookError(f"Webhook verification failed: {str(e)}")
+
+        except stripe.error.SignatureVerificationError as exc:
+            logger.error("webhook_signature_verification_failed", error=str(exc))
+            raise WebhookVerificationError(f"Invalid webhook signature: {exc}") from exc
+
+        except Exception as exc:
+            logger.error("webhook_verification_error", error=str(exc))
+            raise WebhookVerificationError(f"Webhook verification failed: {exc}") from exc
 
     async def is_event_processed(self, event_id: str) -> bool:
+        """
+        Check whether a webhook event has already been processed.
+
+        Degrades gracefully when Redis is unavailable.
+        """
         try:
-            redis = await self._ensure_redis()
-            key = f"webhook:processed:{event_id}"
-            exists = await redis.exists(key)
+            redis_client = await self._ensure_redis()
+            exists = await redis_client.exists(self._processed_event_key(event_id))
             return bool(exists)
-        except Exception as e:
-            logger.warning("webhook_dedup_check_error", error=str(e), event_id=event_id)
+        except Exception as exc:
+            logger.warning(
+                "webhook_dedup_check_error",
+                event_id=event_id,
+                error=str(exc),
+            )
             return False
 
     async def mark_event_processed(
-        self, event_id: str, ttl_seconds: int = 86400 * 7
+        self,
+        event_id: str,
+        ttl_seconds: int = 86400 * 7,
     ) -> None:
+        """
+        Mark a webhook event as processed.
+
+        Degrades gracefully when Redis is unavailable.
+        """
         try:
-            redis = await self._ensure_redis()
-            key = f"webhook:processed:{event_id}"
-            await redis.setex(key, ttl_seconds, "1")
+            redis_client = await self._ensure_redis()
+            await redis_client.setex(
+                self._processed_event_key(event_id),
+                ttl_seconds,
+                "1",
+            )
             logger.info("webhook_marked_processed", event_id=event_id)
-        except Exception as e:
-            logger.warning("webhook_mark_processed_error", error=str(e), event_id=event_id)
+        except Exception as exc:
+            logger.warning(
+                "webhook_mark_processed_error",
+                event_id=event_id,
+                error=str(exc),
+            )
 
     async def process_event(
-        self, event: stripe.Event, db: Optional[AsyncSession] = None
-    ) -> Dict[str, Any]:
+        self,
+        event: stripe.Event,
+        db: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        """
+        Process a Stripe webhook event with deduplication.
+
+        Marks events as processed only after successful handler execution
+        or when no handler exists for the event type.
+        """
         event_id = event.id
         event_type = event.type
         event_data = event.data.object
@@ -138,31 +268,41 @@ class WebhookHandler:
                 result = await handler(event_data)
 
             await self.mark_event_processed(event_id)
-            
-            logger.info("webhook_event_processed_successfully", event_id=event_id)
+
+            logger.info(
+                "webhook_event_processed_successfully",
+                event_id=event_id,
+                event_type=event_type,
+            )
             return {
                 "status": "success",
                 "event_id": event_id,
                 "result": result,
             }
 
-        except Exception as e:
-            logger.error("webhook_event_processing_failed", error=str(e))
-            raise WebhookError(f"Failed to process event {event_id}: {str(e)}")
+        except WebhookError:
+            raise
 
-    # ==========================================
-    # HANDLERS
-    # ==========================================
+        except Exception as exc:
+            logger.error(
+                "webhook_event_processing_failed",
+                event_id=event_id,
+                event_type=event_type,
+                error=str(exc),
+            )
+            raise WebhookProcessingError(
+                f"Failed to process event {event_id}: {exc}"
+            ) from exc
 
     async def handle_payment_intent_succeeded(
-        self, payment_intent: Dict[str, Any], db: AsyncSession
-    ) -> Dict[str, Any]:
+        self,
+        payment_intent: dict[str, Any],
+        db: AsyncSession,
+    ) -> dict[str, Any]:
         """
-        Handle payment_intent.succeeded event using Event Sourcing.
-        1. Find the Payment.
-        2. Create a PaymentEvent (Receipt).
-        3. Update Payment status (Snapshot).
-        4. Commit atomically.
+        Handle payment_intent.succeeded.
+
+        Writes an audit event and updates payment snapshot atomically.
         """
         payment_intent_id = payment_intent["id"]
         amount = payment_intent["amount"]
@@ -172,50 +312,60 @@ class WebhookHandler:
             "handling_payment_intent_succeeded",
             payment_intent_id=payment_intent_id,
             amount=amount,
+            currency=currency,
         )
 
-        # 1. Find the Record (The Whiteboard)
-        query = select(Payment).where(Payment.stripe_payment_intent_id == payment_intent_id)
-        result = await db.execute(query)
-        payment_record = result.scalar_one_or_none()
+        try:
+            payment_record = await self._get_payment_by_intent_id(payment_intent_id, db)
 
-        if not payment_record:
-            # TODO: Senior Challenge - Should we CREATE it here if missing?
-            logger.error("payment_not_found", payment_intent_id=payment_intent_id)
-            return {"status": "error", "message": "Payment not found"}
+            if payment_record is None:
+                logger.warning(
+                    "webhook_payment_not_found_for_success",
+                    payment_intent_id=payment_intent_id,
+                )
+                return {
+                    "status": "not_found",
+                    "payment_intent_id": payment_intent_id,
+                    "message": "Payment not found",
+                }
 
-        # 2. Write the Receipt (Event Sourcing)
-        # This is our permanent, audit-proof history.
-        new_event = PaymentEvent(
-            payment_id=payment_record.id,
-            event_type="payment_intent.succeeded",
-            event_data=payment_intent,
-            correlation_id=uuid.uuid4()
-        )
-        db.add(new_event)
+            await self._record_payment_event(
+                db=db,
+                payment_id=payment_record.id,
+                event_type="payment_intent.succeeded",
+                event_data=payment_intent,
+            )
 
-        # 3. Update the Snapshot
-        # We update the status so the frontend UI is fast.
-        payment_record.status = "succeeded"
+            self._set_payment_status(payment_record, status="succeeded")
 
-        # 4. Atomic Commit
-        # If DB crashes here, BOTH fail. No partial state.
-        await db.commit()
+            await db.commit()
 
-        return {
-            "payment_intent_id": payment_intent_id,
-            "status": "succeeded",
-            "audit_log": True
-        }
+            return {
+                "status": "succeeded",
+                "payment_intent_id": payment_intent_id,
+                "payment_id": str(payment_record.id),
+                "audit_log": True,
+            }
+
+        except Exception:
+            await self._rollback_safely(db, payment_intent_id)
+            raise
 
     async def handle_payment_intent_payment_failed(
-        self, payment_intent: Dict[str, Any], db: AsyncSession
-    ) -> Dict[str, Any]:
+        self,
+        payment_intent: dict[str, Any],
+        db: AsyncSession,
+    ) -> dict[str, Any]:
         """
-        Handle payment failure.
+        Handle payment_intent.payment_failed.
+
+        Writes an audit event and updates payment snapshot atomically.
         """
         payment_intent_id = payment_intent["id"]
-        error_message = payment_intent.get("last_payment_error", {}).get("message", "Unknown error")
+        error_message = payment_intent.get("last_payment_error", {}).get(
+            "message",
+            "Unknown error",
+        )
 
         logger.info(
             "handling_payment_intent_failed",
@@ -223,48 +373,109 @@ class WebhookHandler:
             error=error_message,
         )
 
-        # Ideally, we should add a PaymentEvent here too (e.g. "payment.failed"),
-        # but for this specific lesson, we focus on the simple update.
-        stmt = (
-            update(Payment)
-            .where(Payment.stripe_payment_intent_id == payment_intent_id)
-            .values(status="failed", error_message=error_message)
-        )
-        result = await db.execute(stmt)
-        await db.commit()
+        try:
+            payment_record = await self._get_payment_by_intent_id(payment_intent_id, db)
 
-        return {
-            "payment_intent_id": payment_intent_id,
-            "status": "failed",
-            "rows_updated": result.rowcount,
-        }
+            if payment_record is None:
+                logger.warning(
+                    "webhook_payment_not_found_for_failure",
+                    payment_intent_id=payment_intent_id,
+                )
+                return {
+                    "status": "not_found",
+                    "payment_intent_id": payment_intent_id,
+                    "message": "Payment not found",
+                }
+
+            await self._record_payment_event(
+                db=db,
+                payment_id=payment_record.id,
+                event_type="payment_intent.payment_failed",
+                event_data=payment_intent,
+            )
+
+            self._set_payment_status(
+                payment_record,
+                status="failed",
+                error_message=error_message,
+            )
+
+            await db.commit()
+
+            return {
+                "status": "failed",
+                "payment_intent_id": payment_intent_id,
+                "payment_id": str(payment_record.id),
+                "error_message": error_message,
+                "audit_log": True,
+            }
+
+        except Exception:
+            await self._rollback_safely(db, payment_intent_id)
+            raise
 
     async def handle_charge_refunded(
-        self, charge: Dict[str, Any], db: AsyncSession
-    ) -> Dict[str, Any]:
+        self,
+        charge: dict[str, Any],
+        db: AsyncSession,
+    ) -> dict[str, Any]:
         """
-        Handle refund.
+        Handle charge.refunded.
+
+        Writes an audit event and updates payment snapshot atomically.
         """
         payment_intent_id = charge.get("payment_intent")
         if not payment_intent_id:
-            return {"status": "skipped", "reason": "No payment_intent associated"}
+            logger.warning("webhook_refund_missing_payment_intent")
+            return {
+                "status": "skipped",
+                "reason": "No payment_intent associated",
+            }
 
         logger.info("handling_charge_refunded", payment_intent_id=payment_intent_id)
 
-        stmt = (
-            update(Payment)
-            .where(Payment.stripe_payment_intent_id == payment_intent_id)
-            .values(status="refunded")
-        )
-        result = await db.execute(stmt)
-        await db.commit()
+        try:
+            payment_record = await self._get_payment_by_intent_id(payment_intent_id, db)
 
-        return {
-            "payment_intent_id": payment_intent_id,
-            "status": "refunded",
-            "rows_updated": result.rowcount,
-        }
+            if payment_record is None:
+                logger.warning(
+                    "webhook_payment_not_found_for_refund",
+                    payment_intent_id=payment_intent_id,
+                )
+                return {
+                    "status": "not_found",
+                    "payment_intent_id": payment_intent_id,
+                    "message": "Payment not found",
+                }
+
+            await self._record_payment_event(
+                db=db,
+                payment_id=payment_record.id,
+                event_type="charge.refunded",
+                event_data=charge,
+            )
+
+            self._set_payment_status(payment_record, status="refunded")
+
+            await db.commit()
+
+            return {
+                "status": "refunded",
+                "payment_intent_id": payment_intent_id,
+                "payment_id": str(payment_record.id),
+                "audit_log": True,
+            }
+
+        except Exception:
+            await self._rollback_safely(db, payment_intent_id)
+            raise
 
     async def close(self) -> None:
-        if self.redis_client and self._redis_initialized:
+        """Close Redis client if this handler has one."""
+        if self.redis_client is None or not self._redis_initialized:
+            return
+
+        try:
+            await self.redis_client.aclose()
+        except AttributeError:
             await self.redis_client.close()
