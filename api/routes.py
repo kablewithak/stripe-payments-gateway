@@ -1,19 +1,30 @@
 """
 API routes for payment processing.
 """
+from __future__ import annotations
+
 import time
-from datetime import date
-from typing import Any, Dict
+from datetime import date, timedelta
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.payment_processor import PaymentError, PaymentProcessor, PaymentValidationError
+from core.payment_processor import (
+    PaymentConflictError,
+    PaymentError,
+    PaymentFailedError,
+    PaymentNotFoundError,
+    PaymentProcessor,
+    PaymentProviderError,
+    PaymentValidationError,
+    RefundNotAllowedError,
+)
 from core.reconciliation import ReconciliationEngine
 from database.connection import get_db
-from integrations.webhook_handler import WebhookHandler, WebhookError
+from integrations.webhook_handler import WebhookError, WebhookHandler
 from monitoring.health import HealthCheck
 from monitoring.metrics import metrics
 
@@ -30,26 +41,28 @@ from .schemas import (
 
 logger = structlog.get_logger(__name__)
 
-# Create routers
 payment_router = APIRouter(prefix="/payments", tags=["payments"])
 webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 monitoring_router = APIRouter(tags=["monitoring"])
 
-# Initialize services
 payment_processor = PaymentProcessor()
 webhook_handler = WebhookHandler()
 health_check = HealthCheck()
 reconciliation_engine = ReconciliationEngine()
 
-# Register webhook handlers
 webhook_handler.register_handler(
-    "payment_intent.succeeded", webhook_handler.handle_payment_intent_succeeded
+    "payment_intent.succeeded",
+    webhook_handler.handle_payment_intent_succeeded,
 )
 webhook_handler.register_handler(
-    "payment_intent.payment_failed", webhook_handler.handle_payment_intent_payment_failed
+    "payment_intent.payment_failed",
+    webhook_handler.handle_payment_intent_payment_failed,
 )
-webhook_handler.register_handler("charge.refunded", webhook_handler.handle_charge_refunded)
+webhook_handler.register_handler(
+    "charge.refunded",
+    webhook_handler.handle_charge_refunded,
+)
 
 
 @payment_router.post(
@@ -62,23 +75,22 @@ webhook_handler.register_handler("charge.refunded", webhook_handler.handle_charg
 async def create_payment(
     request: CreatePaymentRequest,
     db: AsyncSession = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Create a new payment.
 
-    This endpoint is idempotent - duplicate requests will return the same payment.
+    This endpoint is idempotent. Duplicate requests return the same payment.
     """
     start_time = time.time()
 
     try:
         logger.info(
             "api_create_payment_request",
-            user_id=request.user_id,
+            user_id=str(request.user_id),
             amount_cents=request.amount_cents,
             currency=request.currency,
         )
 
-        # Create payment
         payment = await payment_processor.create_payment(
             user_id=request.user_id,
             amount_cents=request.amount_cents,
@@ -87,9 +99,12 @@ async def create_payment(
             db=db,
         )
 
-        # Record metrics
         duration = time.time() - start_time
-        metrics.record_payment_request(payment["status"], request.currency, request.amount_cents)
+        metrics.record_payment_request(
+            payment["status"],
+            request.currency,
+            request.amount_cents,
+        )
         metrics.record_payment_duration(duration)
 
         logger.info(
@@ -98,26 +113,49 @@ async def create_payment(
             status=payment["status"],
             duration_seconds=duration,
         )
-
         return payment
 
-    except PaymentValidationError as e:
-        logger.warning("api_create_payment_validation_error", error=str(e))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PaymentValidationError as exc:
+        logger.warning("api_create_payment_validation_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
-    except PaymentError as e:
-        logger.error("api_create_payment_error", error=str(e))
+    except PaymentConflictError as exc:
+        logger.warning("api_create_payment_conflict", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentFailedError as exc:
+        logger.warning("api_create_payment_failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentProviderError as exc:
+        logger.error("api_create_payment_provider_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentError as exc:
+        logger.error("api_create_payment_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Payment creation failed: {str(e)}",
-        )
+            detail="Payment creation failed",
+        ) from exc
 
-    except Exception as e:
-        logger.error("api_create_payment_unexpected_error", error=str(e))
+    except Exception as exc:
+        logger.error("api_create_payment_unexpected_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred",
-        )
+        ) from exc
 
 
 @payment_router.get(
@@ -129,26 +167,43 @@ async def create_payment(
 async def get_payment_status(
     payment_id: str,
     db: AsyncSession = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Get payment status by ID."""
     try:
         payment = await payment_processor.get_payment_status(payment_id, db)
 
         if payment is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Payment not found",
             )
 
         return payment
 
+    except PaymentValidationError as exc:
+        logger.warning(
+            "api_get_payment_status_validation_error",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error("api_get_payment_status_error", payment_id=payment_id, error=str(e))
+
+    except Exception as exc:
+        logger.error(
+            "api_get_payment_status_error",
+            payment_id=payment_id,
+            error=str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve payment status",
-        )
+        ) from exc
 
 
 @payment_router.post(
@@ -161,7 +216,7 @@ async def refund_payment(
     payment_id: str,
     request: RefundRequest,
     db: AsyncSession = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Refund a payment."""
     try:
         logger.info(
@@ -183,18 +238,73 @@ async def refund_payment(
             payment_id=payment_id,
             refund_id=refund["refund_id"],
         )
-
         return refund
 
-    except PaymentError as e:
-        logger.warning("api_refund_payment_error", payment_id=payment_id, error=str(e))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-    except Exception as e:
-        logger.error("api_refund_payment_unexpected_error", payment_id=payment_id, error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Refund failed"
+    except PaymentValidationError as exc:
+        logger.warning(
+            "api_refund_payment_validation_error",
+            payment_id=payment_id,
+            error=str(exc),
         )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentNotFoundError as exc:
+        logger.warning(
+            "api_refund_payment_not_found",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    except RefundNotAllowedError as exc:
+        logger.warning(
+            "api_refund_payment_not_allowed",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentProviderError as exc:
+        logger.error(
+            "api_refund_payment_provider_error",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+
+    except PaymentError as exc:
+        logger.error(
+            "api_refund_payment_error",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Refund failed",
+        ) from exc
+
+    except Exception as exc:
+        logger.error(
+            "api_refund_payment_unexpected_error",
+            payment_id=payment_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Refund failed",
+        ) from exc
 
 
 @webhook_router.post(
@@ -207,7 +317,7 @@ async def stripe_webhook(
     request: Request,
     stripe_signature: str = Header(..., alias="Stripe-Signature"),
     db: AsyncSession = Depends(get_db),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Handle Stripe webhook events.
 
@@ -216,10 +326,7 @@ async def stripe_webhook(
     start_time = time.time()
 
     try:
-        # Get raw body
         body = await request.body()
-
-        # Verify signature
         event = webhook_handler.verify_signature(body, stripe_signature)
 
         logger.info(
@@ -228,25 +335,26 @@ async def stripe_webhook(
             event_type=event.type,
         )
 
-        # Process event
         result = await webhook_handler.process_event(event, db)
 
-        # Record metrics
         duration = time.time() - start_time
         metrics.record_webhook_event(event.type, result["status"], duration)
 
         return result
 
-    except WebhookError as e:
-        logger.error("api_webhook_error", error=str(e))
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except WebhookError as exc:
+        logger.error("api_webhook_error", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
-    except Exception as e:
-        logger.error("api_webhook_unexpected_error", error=str(e))
+    except Exception as exc:
+        logger.error("api_webhook_unexpected_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Webhook processing failed",
-        )
+        ) from exc
 
 
 @admin_router.post(
@@ -257,18 +365,16 @@ async def stripe_webhook(
 )
 async def run_reconciliation(
     reconciliation_date: str | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Run reconciliation for a specific date.
 
-    If no date provided, reconciles yesterday.
+    If no date is provided, reconcile yesterday.
     """
     try:
         if reconciliation_date:
             recon_date = date.fromisoformat(reconciliation_date)
         else:
-            from datetime import timedelta
-
             recon_date = date.today() - timedelta(days=1)
 
         logger.info("api_reconciliation_started", date=recon_date.isoformat())
@@ -280,15 +386,14 @@ async def run_reconciliation(
             date=recon_date.isoformat(),
             discrepancies=len(result["discrepancies"]),
         )
-
         return result
 
-    except Exception as e:
-        logger.error("api_reconciliation_error", error=str(e))
+    except Exception as exc:
+        logger.error("api_reconciliation_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Reconciliation failed: {str(e)}",
-        )
+            detail=f"Reconciliation failed: {str(exc)}",
+        ) from exc
 
 
 @monitoring_router.get(
@@ -297,16 +402,15 @@ async def run_reconciliation(
     summary="Health check",
     description="Check overall system health",
 )
-async def health() -> Dict[str, Any]:
+async def health() -> dict[str, Any]:
     """Health check endpoint for monitoring."""
     try:
-        result = await health_check.check_all()
-        return result
-    except Exception as e:
-        logger.error("health_check_error", error=str(e))
+        return await health_check.check_all()
+    except Exception as exc:
+        logger.error("health_check_error", error=str(exc))
         return {
             "status": "unhealthy",
-            "checks": {"error": str(e)},
+            "checks": {"error": str(exc)},
         }
 
 
@@ -316,7 +420,7 @@ async def health() -> Dict[str, Any]:
     summary="Liveness probe",
     description="Kubernetes liveness probe endpoint",
 )
-async def liveness() -> Dict[str, Any]:
+async def liveness() -> dict[str, Any]:
     """Liveness probe endpoint."""
     return await health_check.liveness()
 
@@ -327,29 +431,37 @@ async def liveness() -> Dict[str, Any]:
     summary="Readiness probe",
     description="Kubernetes readiness probe endpoint",
 )
-async def readiness() -> Dict[str, Any]:
+async def readiness() -> dict[str, Any]:
     """Readiness probe endpoint."""
     try:
         result = await health_check.readiness()
         if result["status"] != "healthy":
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=result)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=result,
+            )
         return result
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error("readiness_check_error", error=str(e))
+
+    except Exception as exc:
+        logger.error("readiness_check_error", error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"status": "unhealthy", "error": str(e)},
-        )
+            detail={"status": "unhealthy", "error": str(exc)},
+        ) from exc
 
 
 @monitoring_router.get(
     "/metrics",
     summary="Prometheus metrics",
     description="Expose Prometheus metrics",
-    include_in_schema=False,  # Don't include in OpenAPI docs
+    include_in_schema=False,
 )
 async def prometheus_metrics() -> Response:
     """Expose Prometheus metrics."""
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
