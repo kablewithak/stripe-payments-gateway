@@ -12,10 +12,11 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-TEST_DATABASE_URL = os.getenv(
-    "TEST_DATABASE_URL",
-    "postgresql+asyncpg://payments_test_user:payments_test_pw@localhost:5432/payments_test",
+DEFAULT_TEST_DATABASE_URL = (
+    "postgresql+asyncpg://payments_test_user:payments_test_pw@127.0.0.1:5432/payments_test"
 )
+
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
 
 # Keep the app deterministic under pytest before importing it.
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
@@ -35,6 +36,7 @@ async def test_db() -> AsyncGenerator[AsyncSession, Any]:
     engine = create_async_engine(
         TEST_DATABASE_URL,
         poolclass=NullPool,
+        connect_args={"timeout": 5},
     )
 
     async with engine.begin() as conn:
