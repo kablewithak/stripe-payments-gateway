@@ -13,7 +13,7 @@ This project focuses on the parts that actually matter in payment systems:
 - **health checks and metrics**
 - **deterministic test coverage**
 
-At the time of writing, the project has a **fully passing test suite** across unit and integration coverage.
+At the time of writing, the project has a Current status: 59 passing tests, 3 intentionally skipped legacy race-condition tests across unit and integration coverage.
 
 ---
 
@@ -343,6 +343,10 @@ webhook deduplication
 refund contract behavior
 health/readiness/liveness routes
 Demo walkthrough
+
+The default test suite is demo-safe and deterministic.
+
+Race-condition stress tests are intentionally skipped in normal local runs because they require isolated DB sessions per concurrent task and a dedicated Redis-backed concurrency setup.
 
 A clean demo flow is:
 
