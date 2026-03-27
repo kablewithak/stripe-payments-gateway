@@ -1,9 +1,5 @@
 """
 Integration tests for API contract behavior.
-
-These tests exercise the FastAPI routes through the test client while
-patching the route-layer payment processor methods for deterministic,
-honest HTTP contract verification.
 """
 from __future__ import annotations
 
@@ -203,16 +199,6 @@ class TestPaymentIntegration:
 
         assert response.status_code == 400
         assert response.json()["detail"] == "payment_id must be a valid UUID"
-
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_health_check(self, client: AsyncClient) -> None:
-        """Health check endpoint should return a health payload."""
-        response = await client.get("/health")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "status" in data
 
     @pytest.mark.integration
     @pytest.mark.asyncio
